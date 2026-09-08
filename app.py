@@ -51,14 +51,38 @@ st.set_page_config(page_title="Nifty CE/PE BEP Levels", layout="wide")
 
 BASE_URL = "https://api.upstox.com"
 
-UNDERLYING_MAP = {
-    "NIFTY": ("NSE_INDEX|Nifty 50", 50),
-    "BANKNIFTY": ("NSE_INDEX|Nifty Bank", 100),
-    "FINNIFTY": ("NSE_INDEX|Nifty Fin Service", 50),
-    "MIDCPNIFTY": ("NSE_INDEX|NIFTY MID SELECT", 25),
+OFFSETS = [1, 2, 3, 4]  # UP1..UP4 / DN1..DN4 (multiplied by strike step)
+
+# One tab per index. expiry_weekday: 0=Mon .. 6=Sun. monthly_only=True means
+# only the last occurrence of that weekday in the month trades (matches
+# NSE/BSE's current 2026 schedule: NIFTY weekly Tue, SENSEX weekly Thu,
+# BANKNIFTY monthly-only, last Tuesday -- verify against Upstox/NSE if this
+# changes again, it's only used to prefill the expiry date picker below).
+TAB_CONFIGS = {
+    "NIFTY": {"underlying_key": "NSE_INDEX|Nifty 50", "strike_step": 50,
+              "expiry_weekday": 1, "monthly_only": False},
+    "BANKNIFTY": {"underlying_key": "NSE_INDEX|Nifty Bank", "strike_step": 100,
+                  "expiry_weekday": 1, "monthly_only": True},
+    "SENSEX": {"underlying_key": "BSE_INDEX|SENSEX", "strike_step": 100,
+               "expiry_weekday": 3, "monthly_only": False},
 }
 
-OFFSETS = [1, 2, 3, 4]  # UP1..UP4 / DN1..DN4 (multiplied by strike step)
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    first_next = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    d = first_next - timedelta(days=1)
+    return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+
+def default_expiry(weekday: int, monthly_only: bool) -> date:
+    today = date.today()
+    if not monthly_only:
+        return today + timedelta(days=(weekday - today.weekday()) % 7)
+    d = _last_weekday_of_month(today.year, today.month, weekday)
+    if d < today:  # this month's last occurrence already passed -> roll to next month
+        y, m = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+        d = _last_weekday_of_month(y, m, weekday)
+    return d
 
 
 # ======================================================================
@@ -304,19 +328,12 @@ with st.sidebar:
     st.subheader("Upstox")
     access_token = st.text_input("Access Token", type="password", help="Today's Upstox v3 access token")
 
-    st.subheader("Contract Setup")
-    symbol = st.selectbox("Symbol", list(UNDERLYING_MAP.keys()), index=0)
-    default_key, default_step = UNDERLYING_MAP[symbol]
-    underlying_key = st.text_input("Underlying Instrument Key", value=default_key)
-    strike_step = st.number_input("Strike Step", value=default_step, step=1, min_value=1)
-    expiry = st.date_input("Expiry Date", value=date.today() + timedelta(days=(3 - date.today().weekday()) % 7))
-
-    st.subheader("Signal Settings")
+    st.subheader("Signal Settings (applies to all tabs)")
     entry_tf = st.selectbox("Entry Timeframe (minutes)", [1, 3, 5, 10, 15], index=1)
     max_rows = st.number_input("Max Rows in Journal", value=20, min_value=1, max_value=200)
     refresh_secs = st.number_input("Auto-refresh (seconds)", value=30, min_value=10, max_value=300, step=5)
 
-st.title("Nifty CE/PE BEP Levels — Live Entry / Target / SL")
+st.title("Nifty / BankNifty / Sensex — CE/PE BEP Levels, Live Entry / Target / SL")
 
 if not access_token:
     st.info("Enter your Upstox access token in the sidebar to begin.")
@@ -324,18 +341,17 @@ if not access_token:
 
 
 # ======================================================================
-# Live panel (auto-refreshing)
+# Per-symbol render (called inside each tab's own auto-refreshing fragment)
 # ======================================================================
 
-@st.fragment(run_every=f"{int(refresh_secs)}s")
-def live_panel():
+def render_symbol(symbol: str, underlying_key: str, strike_step: int, expiry: date):
     try:
-        nifty_open = fetch_nifty_open(underlying_key, access_token)
+        idx_open = fetch_nifty_open(underlying_key, access_token)
     except Exception as e:
         st.error(f"Could not fetch {symbol} open price: {e}")
         return
 
-    atm_strike = int(round(nifty_open / strike_step) * strike_step)
+    atm_strike = int(round(idx_open / strike_step) * strike_step)
 
     try:
         contracts_df = fetch_option_contracts(underlying_key, expiry.strftime("%Y-%m-%d"), access_token)
@@ -367,7 +383,7 @@ def live_panel():
     levels_df = compute_levels(candles, strike_step)
 
     st.caption(
-        f"{symbol} open: **{nifty_open:.2f}** → nearby strike **{atm_strike}** "
+        f"{symbol} open: **{idx_open:.2f}** → nearby strike **{atm_strike}** "
         f"({entry_tf}-min candles, refreshing every {int(refresh_secs)}s)"
     )
 
@@ -413,6 +429,39 @@ def live_panel():
         )
 
     st.caption(f"Last updated: {pd.Timestamp.now(tz='Asia/Kolkata').strftime('%H:%M:%S')}")
+
+
+# ======================================================================
+# Tabs: NIFTY | BANKNIFTY | SENSEX — each with its own expiry/strike-step
+# controls and its own independently auto-refreshing fragment
+# ======================================================================
+
+tab_objs = st.tabs(list(TAB_CONFIGS.keys()))
+
+for (tab_name, cfg), tab in zip(TAB_CONFIGS.items(), tab_objs):
+    with tab:
+        c1, c2 = st.columns(2)
+        with c1:
+            tab_expiry = st.date_input(
+                "Expiry Date", value=default_expiry(cfg["expiry_weekday"], cfg["monthly_only"]),
+                key=f"expiry_{tab_name}",
+            )
+        with c2:
+            tab_strike_step = st.number_input(
+                "Strike Step", value=cfg["strike_step"], step=1, min_value=1, key=f"step_{tab_name}",
+            )
+        tab_underlying_key = st.text_input(
+            "Underlying Instrument Key", value=cfg["underlying_key"], key=f"key_{tab_name}",
+        )
+
+        def _make_fragment(symbol=tab_name, underlying_key=tab_underlying_key,
+                            strike_step=tab_strike_step, expiry=tab_expiry):
+            @st.fragment(run_every=f"{int(refresh_secs)}s")
+            def _f():
+                render_symbol(symbol, underlying_key, int(strike_step), expiry)
+            return _f
+
+        _make_fragment()()
 
 
 live_panel()
