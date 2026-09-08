@@ -59,11 +59,11 @@ OFFSETS = [1, 2, 3, 4]  # UP1..UP4 / DN1..DN4 (multiplied by strike step)
 # BANKNIFTY monthly-only, last Tuesday -- verify against Upstox/NSE if this
 # changes again, it's only used to prefill the expiry date picker below).
 TAB_CONFIGS = {
-    "NIFTY": {"underlying_key": "NSE_INDEX|Nifty 50", "strike_step": 50,
+    "NIFTY": {"tag": "NIFTY", "underlying_key": "NSE_INDEX|Nifty 50", "strike_step": 50,
               "expiry_weekday": 1, "monthly_only": False},
-    "BANKNIFTY": {"underlying_key": "NSE_INDEX|Nifty Bank", "strike_step": 100,
+    "BANKNIFTY": {"tag": "BN", "underlying_key": "NSE_INDEX|Nifty Bank", "strike_step": 100,
                   "expiry_weekday": 1, "monthly_only": True},
-    "SENSEX": {"underlying_key": "BSE_INDEX|SENSEX", "strike_step": 100,
+    "SENSEX": {"tag": "SENSEX", "underlying_key": "BSE_INDEX|SENSEX", "strike_step": 100,
                "expiry_weekday": 3, "monthly_only": False},
 }
 
@@ -344,7 +344,7 @@ if not access_token:
 # Per-symbol render (called inside each tab's own auto-refreshing fragment)
 # ======================================================================
 
-def render_symbol(symbol: str, underlying_key: str, strike_step: int, expiry: date):
+def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, expiry: date):
     try:
         idx_open = fetch_nifty_open(underlying_key, access_token)
     except Exception as e:
@@ -420,11 +420,12 @@ def render_symbol(symbol: str, underlying_key: str, strike_step: int, expiry: da
             "entry": "Entry", "target": "Target", "sl": "SL",
             "exit": "Exit", "result": "Result",
         })
+        display_df.insert(0, "Symbol", tag)  # tag every row with its own tab (NIFTY / BN / SENSEX)
         display_df["Time"] = pd.to_datetime(display_df["Time"]).dt.strftime("%H:%M")
         for c in ["Entry", "Target", "SL", "Exit"]:
             display_df[c] = display_df[c].map(lambda v: "-" if pd.isna(v) else f"{v:.2f}")
         st.dataframe(
-            display_df.style.applymap(style_result, subset=["Result"]),
+            display_df.style.map(style_result, subset=["Result"]),
             use_container_width=True, hide_index=True,
         )
 
@@ -436,17 +437,33 @@ def render_symbol(symbol: str, underlying_key: str, strike_step: int, expiry: da
 # controls and its own independently auto-refreshing fragment
 # ======================================================================
 
+def _on_expiry_type_change(weekday, type_key, date_key):
+    monthly = st.session_state[type_key] == "Monthly"
+    st.session_state[date_key] = default_expiry(weekday, monthly)
+
+
 tab_objs = st.tabs(list(TAB_CONFIGS.keys()))
 
 for (tab_name, cfg), tab in zip(TAB_CONFIGS.items(), tab_objs):
     with tab:
-        c1, c2 = st.columns(2)
+        type_key = f"expiry_type_{tab_name}"
+        date_key = f"expiry_{tab_name}"
+        if type_key not in st.session_state:
+            st.session_state[type_key] = "Monthly" if cfg["monthly_only"] else "Weekly"
+        if date_key not in st.session_state:
+            st.session_state[date_key] = default_expiry(cfg["expiry_weekday"], cfg["monthly_only"])
+
+        c1, c2, c3 = st.columns(3)
         with c1:
-            tab_expiry = st.date_input(
-                "Expiry Date", value=default_expiry(cfg["expiry_weekday"], cfg["monthly_only"]),
-                key=f"expiry_{tab_name}",
+            st.selectbox(
+                "Expiry Type", ["Weekly", "Monthly"], key=type_key,
+                on_change=_on_expiry_type_change, args=(cfg["expiry_weekday"], type_key, date_key),
+                help="NIFTY/SENSEX currently trade weekly; BANKNIFTY is monthly-only since Nov 2024 "
+                     "— picking a type not actually listed on the exchange will just return no contracts.",
             )
         with c2:
+            tab_expiry = st.date_input("Expiry Date", key=date_key)
+        with c3:
             tab_strike_step = st.number_input(
                 "Strike Step", value=cfg["strike_step"], step=1, min_value=1, key=f"step_{tab_name}",
             )
@@ -454,11 +471,11 @@ for (tab_name, cfg), tab in zip(TAB_CONFIGS.items(), tab_objs):
             "Underlying Instrument Key", value=cfg["underlying_key"], key=f"key_{tab_name}",
         )
 
-        def _make_fragment(symbol=tab_name, underlying_key=tab_underlying_key,
+        def _make_fragment(symbol=tab_name, tag=cfg["tag"], underlying_key=tab_underlying_key,
                             strike_step=tab_strike_step, expiry=tab_expiry):
             @st.fragment(run_every=f"{int(refresh_secs)}s")
             def _f():
-                render_symbol(symbol, underlying_key, int(strike_step), expiry)
+                render_symbol(symbol, tag, underlying_key, int(strike_step), expiry)
             return _f
 
         _make_fragment()()
