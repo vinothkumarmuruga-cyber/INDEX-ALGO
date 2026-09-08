@@ -171,7 +171,7 @@ def compute_levels(candles: dict, strike_step: int) -> pd.DataFrame:
     """
     candles keys expected: 'CE_0' (ATM), 'CE_+1'..'CE_+4', 'CE_-1'..'CE_-4',
     and the same with 'PE_' prefix. Returns one row per 3-min bar with
-    columns: timestamp, ce_close, ce_low, pe_close, pe_low,
+    columns: timestamp, ce_close, ce_high, ce_low, pe_close, pe_high, pe_low,
     ce_up1..4, ce_dn1..4, pe_up1..4, pe_dn1..4
 
     Per your table, each leg's levels are built against the OTHER leg's
@@ -188,9 +188,11 @@ def compute_levels(candles: dict, strike_step: int) -> pd.DataFrame:
     if ce0.empty or pe0.empty:
         return pd.DataFrame()
 
-    merged = ce0[["timestamp", "close", "low"]].rename(columns={"close": "ce_close", "low": "ce_low"})
+    merged = ce0[["timestamp", "close", "high", "low"]].rename(
+        columns={"close": "ce_close", "high": "ce_high", "low": "ce_low"})
     merged = merged.merge(
-        pe0[["timestamp", "close", "low"]].rename(columns={"close": "pe_close", "low": "pe_low"}),
+        pe0[["timestamp", "close", "high", "low"]].rename(
+            columns={"close": "pe_close", "high": "pe_high", "low": "pe_low"}),
         on="timestamp", how="inner",
     )
 
@@ -248,16 +250,18 @@ def _try_open(side, other, tag, prev_row, row, sl_buffer):
 
 
 def _try_chain(side, trade, row, sl_buffer):
-    """Target just hit = price already closed above that line, i.e. the next
-    level's breakout condition. Roll straight into it without re-checking the
-    other leg's confirmation (same trade, riding the ladder up)."""
+    """Target just hit (an intrabar touch, not necessarily a close) = price already
+    reached the next level's breakout price. Roll straight into it, entering at
+    that same touched level (not the bar's close, which can be anywhere after a
+    spike-and-pullback), without re-checking the other leg's confirmation (same
+    trade, riding the ladder up)."""
     n = trade["target_n"]
     if n >= OFFSETS[-1]:  # UP4 hit -> top of the ladder, cycle ends here
         return None
     new_n = n + 1
     return {
         "time": row["timestamp"], "side": trade["side"],
-        "line": f"{side.upper()}-UP{n} (chain)", "entry": row[f"{side}_close"],
+        "line": f"{side.upper()}-UP{n} (chain)", "entry": trade["target"],
         "target": row[f"{side}_up{new_n}"], "target_n": new_n,
         "sl": row[f"{side}_low"] - sl_buffer, "exit": None, "result": "In Trade",
         "pnl_points": None,
@@ -301,10 +305,10 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
                     journal.append(open_ce)
             else:
                 if row["ce_low"] <= open_ce["sl"]:
-                    _close_trade(open_ce, row["ce_low"], "SL Hit")
+                    _close_trade(open_ce, open_ce["sl"], "SL Hit")
                     open_ce = None
-                elif not pd.isna(open_ce["target"]) and row["ce_close"] >= open_ce["target"]:
-                    _close_trade(open_ce, row["ce_close"], "Target Hit")
+                elif not pd.isna(open_ce["target"]) and row["ce_high"] >= open_ce["target"]:
+                    _close_trade(open_ce, open_ce["target"], "Target Hit")
                     chained = _try_chain("ce", open_ce, row, sl_buffer) if entries_allowed else None
                     open_ce = chained
                     if chained:
@@ -318,10 +322,10 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
                     journal.append(open_pe)
             else:
                 if row["pe_low"] <= open_pe["sl"]:
-                    _close_trade(open_pe, row["pe_low"], "SL Hit")
+                    _close_trade(open_pe, open_pe["sl"], "SL Hit")
                     open_pe = None
-                elif not pd.isna(open_pe["target"]) and row["pe_close"] >= open_pe["target"]:
-                    _close_trade(open_pe, row["pe_close"], "Target Hit")
+                elif not pd.isna(open_pe["target"]) and row["pe_high"] >= open_pe["target"]:
+                    _close_trade(open_pe, open_pe["target"], "Target Hit")
                     chained = _try_chain("pe", open_pe, row, sl_buffer) if entries_allowed else None
                     open_pe = chained
                     if chained:
