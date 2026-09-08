@@ -479,6 +479,3 @@ for (tab_name, cfg), tab in zip(TAB_CONFIGS.items(), tab_objs):
             return _f
 
         _make_fragment()()
-
-
-live_panel()
