@@ -58,13 +58,15 @@ OFFSETS = [1, 2, 3, 4]  # UP1..UP4 / DN1..DN4 (multiplied by strike step)
 # NSE/BSE's current 2026 schedule: NIFTY weekly Tue, SENSEX weekly Thu,
 # BANKNIFTY monthly-only, last Tuesday -- verify against Upstox/NSE if this
 # changes again, it's only used to prefill the expiry date picker below).
+# lot_size defaults are current as of Sep 2026 (NSE/BSE revise these periodically
+# -- overridable per tab below, check the exchange circular if a PnL looks off).
 TAB_CONFIGS = {
     "NIFTY": {"tag": "NIFTY", "underlying_key": "NSE_INDEX|Nifty 50", "strike_step": 50,
-              "expiry_weekday": 1, "monthly_only": False},
+              "expiry_weekday": 1, "monthly_only": False, "lot_size": 65},
     "BANKNIFTY": {"tag": "BN", "underlying_key": "NSE_INDEX|Nifty Bank", "strike_step": 100,
-                  "expiry_weekday": 1, "monthly_only": True},
+                  "expiry_weekday": 1, "monthly_only": True, "lot_size": 30},
     "SENSEX": {"tag": "SENSEX", "underlying_key": "BSE_INDEX|SENSEX", "strike_step": 100,
-               "expiry_weekday": 3, "monthly_only": False},
+               "expiry_weekday": 3, "monthly_only": False, "lot_size": 20},
 }
 
 
@@ -239,6 +241,7 @@ def _try_open(side, other, tag, prev_row, row, sl_buffer):
                     "line": f"{side.upper()}-UP{n}", "entry": row[f"{side}_close"],
                     "target": row[f"{side}_up{n + 1}"], "target_n": n + 1,
                     "sl": row[f"{side}_low"] - sl_buffer, "exit": None, "result": "In Trade",
+                    "pnl_points": None,
                 }
             return None  # crossed but not confirmed by the other leg -> no entry this bar
     return None
@@ -257,7 +260,14 @@ def _try_chain(side, trade, row, sl_buffer):
         "line": f"{side.upper()}-UP{n} (chain)", "entry": row[f"{side}_close"],
         "target": row[f"{side}_up{new_n}"], "target_n": new_n,
         "sl": row[f"{side}_low"] - sl_buffer, "exit": None, "result": "In Trade",
+        "pnl_points": None,
     }
+
+
+def _close_trade(trade, exit_price, result):
+    trade["exit"] = exit_price
+    trade["result"] = result
+    trade["pnl_points"] = exit_price - trade["entry"]  # long-premium PnL: +ve on Target Hit, -ve on SL Hit
 
 
 def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
@@ -291,10 +301,10 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
                     journal.append(open_ce)
             else:
                 if row["ce_low"] <= open_ce["sl"]:
-                    open_ce["exit"], open_ce["result"] = row["ce_low"], "SL Hit"
+                    _close_trade(open_ce, row["ce_low"], "SL Hit")
                     open_ce = None
                 elif not pd.isna(open_ce["target"]) and row["ce_close"] >= open_ce["target"]:
-                    open_ce["exit"], open_ce["result"] = row["ce_close"], "Target Hit"
+                    _close_trade(open_ce, row["ce_close"], "Target Hit")
                     chained = _try_chain("ce", open_ce, row, sl_buffer) if entries_allowed else None
                     open_ce = chained
                     if chained:
@@ -308,10 +318,10 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
                     journal.append(open_pe)
             else:
                 if row["pe_low"] <= open_pe["sl"]:
-                    open_pe["exit"], open_pe["result"] = row["pe_low"], "SL Hit"
+                    _close_trade(open_pe, row["pe_low"], "SL Hit")
                     open_pe = None
                 elif not pd.isna(open_pe["target"]) and row["pe_close"] >= open_pe["target"]:
-                    open_pe["exit"], open_pe["result"] = row["pe_close"], "Target Hit"
+                    _close_trade(open_pe, row["pe_close"], "Target Hit")
                     chained = _try_chain("pe", open_pe, row, sl_buffer) if entries_allowed else None
                     open_pe = chained
                     if chained:
@@ -369,7 +379,7 @@ if not access_token:
 # Per-symbol render (called inside each tab's own auto-refreshing fragment)
 # ======================================================================
 
-def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, expiry: date):
+def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, expiry: date, lot_size: int):
     try:
         idx_open = fetch_nifty_open(underlying_key, access_token)
     except Exception as e:
@@ -441,23 +451,36 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
 
     # ---- journal ----
     journal_df = build_journal(levels_df, int(max_rows), sl_buffer=sl_buffer, no_trade_after=no_trade_after)
-    st.subheader("Entry / Target / SL Journal")
+    st.subheader(f"Entry / Target / SL Journal (PnL @ 1 lot = {lot_size})")
     if journal_df.empty:
         st.caption("No signals yet today.")
     else:
+        journal_df = journal_df.copy()
+        journal_df["pnl"] = journal_df["pnl_points"] * lot_size  # keep numeric for the total below
+
         display_df = journal_df.rename(columns={
             "time": "Time", "side": "Side", "line": "Line",
             "entry": "Entry", "target": "Target", "sl": "SL",
-            "exit": "Exit", "result": "Result",
+            "exit": "Exit", "result": "Result", "pnl": "PnL (1 lot)",
         })
         display_df.insert(0, "Symbol", tag)  # tag every row with its own tab (NIFTY / BN / SENSEX)
         display_df["Time"] = pd.to_datetime(display_df["Time"]).dt.strftime("%H:%M")
         for c in ["Entry", "Target", "SL", "Exit"]:
             display_df[c] = display_df[c].map(lambda v: "-" if pd.isna(v) else f"{v:.2f}")
+        display_df["PnL (1 lot)"] = display_df["PnL (1 lot)"].map(lambda v: "-" if pd.isna(v) else f"{v:+.2f}")
+        display_df = display_df.drop(columns=["pnl_points"])
+
         st.dataframe(
             display_df.style.map(style_result, subset=["Result"]),
             use_container_width=True, hide_index=True,
         )
+
+        realized = journal_df["pnl"].dropna()
+        if not realized.empty:
+            st.caption(
+                f"Realized PnL today ({len(realized)} closed trade{'s' if len(realized) != 1 else ''}, "
+                f"1 lot = {lot_size}): **{realized.sum():+.2f}**"
+            )
 
     st.caption(f"Last updated: {pd.Timestamp.now(tz='Asia/Kolkata').strftime('%H:%M:%S')}")
 
@@ -483,7 +506,7 @@ for (tab_name, cfg), tab in zip(TAB_CONFIGS.items(), tab_objs):
         if date_key not in st.session_state:
             st.session_state[date_key] = default_expiry(cfg["expiry_weekday"], cfg["monthly_only"])
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.selectbox(
                 "Expiry Type", ["Weekly", "Monthly"], key=type_key,
@@ -497,16 +520,21 @@ for (tab_name, cfg), tab in zip(TAB_CONFIGS.items(), tab_objs):
             tab_strike_step = st.number_input(
                 "Strike Step", value=cfg["strike_step"], step=1, min_value=1, key=f"step_{tab_name}",
             )
+        with c4:
+            tab_lot_size = st.number_input(
+                "Lot Size", value=cfg["lot_size"], step=1, min_value=1, key=f"lot_{tab_name}",
+                help="NSE/BSE revise lot sizes periodically — update if this no longer matches the exchange.",
+            )
         tab_underlying_key = st.text_input(
             "Underlying Instrument Key", value=cfg["underlying_key"], key=f"key_{tab_name}",
         )
 
         def _make_fragment(symbol=tab_name, tag=cfg["tag"], underlying_key=tab_underlying_key,
-                            strike_step=tab_strike_step, expiry=tab_expiry):
+                            strike_step=tab_strike_step, expiry=tab_expiry, lot_size=tab_lot_size):
             run_every = f"{int(refresh_secs)}s" if auto_refresh_on else None
             @st.fragment(run_every=run_every)
             def _f():
-                render_symbol(symbol, tag, underlying_key, int(strike_step), expiry)
+                render_symbol(symbol, tag, underlying_key, int(strike_step), expiry, int(lot_size))
             return _f
 
         _make_fragment()()
