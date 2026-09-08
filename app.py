@@ -143,7 +143,12 @@ def fetch_intraday_candles(instrument_key: str, token: str, interval_minutes: in
     if df.empty:
         return df
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df[["timestamp", "open", "high", "low", "close"]].sort_values("timestamp").reset_index(drop=True)
+    df = df[["timestamp", "open", "high", "low", "close"]].sort_values("timestamp")
+    # guard against Upstox ever returning a duplicate/re-stated bar for the same
+    # timestamp (would otherwise fan out row counts across the per-leg merges in
+    # compute_levels and misalign which candle's low/high a check is really using)
+    df = df.drop_duplicates(subset="timestamp", keep="last")
+    return df.reset_index(drop=True)
 
 
 def fetch_many_candles(instrument_keys: dict, token: str, interval_minutes: int) -> dict:
