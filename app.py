@@ -41,7 +41,7 @@ own developer docs. If Upstox changes them, the three functions in the
 
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, time as dtime, timedelta
 
 import pandas as pd
 import requests
@@ -226,7 +226,7 @@ def _crossed_up(prev_close, prev_line, close, line):
     return prev_close <= prev_line and close > line
 
 
-def _try_open(side, other, tag, prev_row, row):
+def _try_open(side, other, tag, prev_row, row, sl_buffer):
     """Look for a fresh close-above-UPn crossover (n=1..3) confirmed by the other
     leg sitting below its DN1. Only the first level that freshly crosses this bar
     is considered (matches one signal per bar)."""
@@ -238,13 +238,13 @@ def _try_open(side, other, tag, prev_row, row):
                     "time": row["timestamp"], "side": tag,
                     "line": f"{side.upper()}-UP{n}", "entry": row[f"{side}_close"],
                     "target": row[f"{side}_up{n + 1}"], "target_n": n + 1,
-                    "sl": row[f"{side}_low"], "exit": None, "result": "In Trade",
+                    "sl": row[f"{side}_low"] - sl_buffer, "exit": None, "result": "In Trade",
                 }
             return None  # crossed but not confirmed by the other leg -> no entry this bar
     return None
 
 
-def _try_chain(side, trade, row):
+def _try_chain(side, trade, row, sl_buffer):
     """Target just hit = price already closed above that line, i.e. the next
     level's breakout condition. Roll straight into it without re-checking the
     other leg's confirmation (same trade, riding the ladder up)."""
@@ -256,11 +256,20 @@ def _try_chain(side, trade, row):
         "time": row["timestamp"], "side": trade["side"],
         "line": f"{side.upper()}-UP{n} (chain)", "entry": row[f"{side}_close"],
         "target": row[f"{side}_up{new_n}"], "target_n": new_n,
-        "sl": row[f"{side}_low"], "exit": None, "result": "In Trade",
+        "sl": row[f"{side}_low"] - sl_buffer, "exit": None, "result": "In Trade",
     }
 
 
-def build_journal(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
+                   no_trade_after: dtime | None = None) -> pd.DataFrame:
+    """
+    sl_buffer: points subtracted from the entry candle's low before it's used
+        as SL, e.g. sl_buffer=2 turns a low of 75 into an SL of 73 (a little
+        room below the candle so a wick-touch doesn't stop you out instantly).
+    no_trade_after: no NEW entries (fresh or chained) on bars whose candle
+        time is at/after this cutoff. Trades already open still get their
+        SL/target checked and can still close normally.
+    """
     if df.empty or len(df) < 2:
         return pd.DataFrame()
 
@@ -271,9 +280,12 @@ def build_journal(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     prev = None
     for _, row in df.iterrows():
         if prev is not None:
+            bar_time = pd.Timestamp(row["timestamp"]).time()
+            entries_allowed = no_trade_after is None or bar_time < no_trade_after
+
             # ---- CE (bullish) side: CE breaks UPn while PE sits below PE-DN1 ----
             if open_ce is None:
-                new_trade = _try_open("ce", "pe", "CE (Bullish)", prev, row)
+                new_trade = _try_open("ce", "pe", "CE (Bullish)", prev, row, sl_buffer) if entries_allowed else None
                 if new_trade:
                     open_ce = new_trade
                     journal.append(open_ce)
@@ -283,14 +295,14 @@ def build_journal(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
                     open_ce = None
                 elif not pd.isna(open_ce["target"]) and row["ce_close"] >= open_ce["target"]:
                     open_ce["exit"], open_ce["result"] = row["ce_close"], "Target Hit"
-                    chained = _try_chain("ce", open_ce, row)
+                    chained = _try_chain("ce", open_ce, row, sl_buffer) if entries_allowed else None
                     open_ce = chained
                     if chained:
                         journal.append(chained)
 
             # ---- PE (bearish) side: PE breaks UPn while CE sits below CE-DN1 ----
             if open_pe is None:
-                new_trade = _try_open("pe", "ce", "PE (Bearish)", prev, row)
+                new_trade = _try_open("pe", "ce", "PE (Bearish)", prev, row, sl_buffer) if entries_allowed else None
                 if new_trade:
                     open_pe = new_trade
                     journal.append(open_pe)
@@ -300,7 +312,7 @@ def build_journal(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
                     open_pe = None
                 elif not pd.isna(open_pe["target"]) and row["pe_close"] >= open_pe["target"]:
                     open_pe["exit"], open_pe["result"] = row["pe_close"], "Target Hit"
-                    chained = _try_chain("pe", open_pe, row)
+                    chained = _try_chain("pe", open_pe, row, sl_buffer) if entries_allowed else None
                     open_pe = chained
                     if chained:
                         journal.append(chained)
@@ -331,7 +343,20 @@ with st.sidebar:
     st.subheader("Signal Settings (applies to all tabs)")
     entry_tf = st.selectbox("Entry Timeframe (minutes)", [1, 3, 5, 10, 15], index=1)
     max_rows = st.number_input("Max Rows in Journal", value=20, min_value=1, max_value=200)
-    refresh_secs = st.number_input("Auto-refresh (seconds)", value=30, min_value=10, max_value=300, step=5)
+    sl_buffer = st.number_input(
+        "SL Buffer (points below candle low)", value=2.0, min_value=0.0, step=0.5,
+        help="Subtracted from the entry candle's low, e.g. low=75 with buffer=2 -> SL=73.",
+    )
+    no_trade_after = st.time_input("No new trades after", value=dtime(14, 45))
+
+    st.subheader("Refresh")
+    auto_refresh_on = st.checkbox(
+        "Auto-refresh", value=True,
+        help="Turn off after market hours to stop polling Upstox — use 'Refresh Now' in each tab instead.",
+    )
+    refresh_secs = st.number_input(
+        "Auto-refresh (seconds)", value=30, min_value=10, max_value=300, step=5, disabled=not auto_refresh_on,
+    )
 
 st.title("Nifty / BankNifty / Sensex — CE/PE BEP Levels, Live Entry / Target / SL")
 
@@ -382,10 +407,15 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
     candles = fetch_many_candles(needed, access_token, int(entry_tf))
     levels_df = compute_levels(candles, strike_step)
 
-    st.caption(
-        f"{symbol} open: **{idx_open:.2f}** → nearby strike **{atm_strike}** "
-        f"({entry_tf}-min candles, refreshing every {int(refresh_secs)}s)"
-    )
+    cap_col, btn_col = st.columns([5, 1])
+    with cap_col:
+        refresh_desc = f"refreshing every {int(refresh_secs)}s" if auto_refresh_on else "auto-refresh OFF"
+        st.caption(
+            f"{symbol} open: **{idx_open:.2f}** → nearby strike **{atm_strike}** "
+            f"({entry_tf}-min candles, {refresh_desc}, no new trades after {no_trade_after.strftime('%H:%M')})"
+        )
+    with btn_col:
+        st.button("Refresh now", key=f"refresh_btn_{symbol}", use_container_width=True)
 
     if levels_df.empty:
         st.warning("No overlapping candle data yet for the selected strikes — try again in a moment.")
@@ -410,7 +440,7 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
     st.dataframe(levels_table.style.format("{:.2f}"), use_container_width=True)
 
     # ---- journal ----
-    journal_df = build_journal(levels_df, int(max_rows))
+    journal_df = build_journal(levels_df, int(max_rows), sl_buffer=sl_buffer, no_trade_after=no_trade_after)
     st.subheader("Entry / Target / SL Journal")
     if journal_df.empty:
         st.caption("No signals yet today.")
@@ -473,7 +503,8 @@ for (tab_name, cfg), tab in zip(TAB_CONFIGS.items(), tab_objs):
 
         def _make_fragment(symbol=tab_name, tag=cfg["tag"], underlying_key=tab_underlying_key,
                             strike_step=tab_strike_step, expiry=tab_expiry):
-            @st.fragment(run_every=f"{int(refresh_secs)}s")
+            run_every = f"{int(refresh_secs)}s" if auto_refresh_on else None
+            @st.fragment(run_every=run_every)
             def _f():
                 render_symbol(symbol, tag, underlying_key, int(strike_step), expiry)
             return _f
