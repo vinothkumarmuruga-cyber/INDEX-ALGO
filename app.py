@@ -9,15 +9,15 @@ Reproduces, live, the level/entry table you sketched:
                | STRIKE PE | UP1 UP2 UP3 UP4 | DN1 DN2 DN3 DN4
                |   23750   |
 
-Nearby strike = today's NIFTY open rounded to the strike step. UPn/DNn on
-each leg (CE, PE) are the same "average of two option closes" BEP-style
-calc already used in your Pine script, just organised per-leg instead of
-mixed together:
+Nearby strike = today's NIFTY open rounded to the strike step. UPn/DNn are
+the "average of two option closes" BEP-style calc, cross-leg per your
+corrected table (each leg's levels are priced against the OTHER leg's
+option at the offset strike, not more of the same leg):
 
-    CE UPn = (close of ATM CE + close of CE at strike+n*step) / 2
-    CE DNn = (close of ATM CE + close of CE at strike-n*step) / 2
-    PE UPn = (close of ATM PE + close of PE at strike+n*step) / 2
-    PE DNn = (close of ATM PE + close of PE at strike-n*step) / 2
+    CE UPn = (close of ATM CE + close of PE at strike+n*step) / 2
+    CE DNn = (close of ATM CE + close of PE at strike-n*step) / 2
+    PE UPn = (close of ATM PE + close of CE at strike-n*step) / 2
+    PE DNn = (close of ATM PE + close of CE at strike+n*step) / 2
 
 ENTRY LOGIC (as you described):
     Bullish (CE) entry -> CE closes (3-min TF) above CE-UP1  AND, same bar,
@@ -147,6 +147,15 @@ def compute_levels(candles: dict, strike_step: int) -> pd.DataFrame:
     and the same with 'PE_' prefix. Returns one row per 3-min bar with
     columns: timestamp, ce_close, ce_low, pe_close, pe_low,
     ce_up1..4, ce_dn1..4, pe_up1..4, pe_dn1..4
+
+    Per your table, each leg's levels are built against the OTHER leg's
+    option at the offset strike (this is what a strangle/BEP combo actually
+    prices), not against more of the same leg:
+
+        CE-UPn = avg(ATM CE close, PE close at strike + n*step)   <- PE strike ABOVE atm
+        CE-DNn = avg(ATM CE close, PE close at strike - n*step)   <- PE strike BELOW atm
+        PE-UPn = avg(ATM PE close, CE close at strike - n*step)   <- CE strike BELOW atm
+        PE-DNn = avg(ATM PE close, CE close at strike + n*step)   <- CE strike ABOVE atm
     """
     ce0 = candles.get("CE_0", pd.DataFrame())
     pe0 = candles.get("PE_0", pd.DataFrame())
@@ -159,27 +168,25 @@ def compute_levels(candles: dict, strike_step: int) -> pd.DataFrame:
         on="timestamp", how="inner",
     )
 
+    # (result column, base-leg column, other-leg candle key)
+    spec = []
     for n in OFFSETS:
-        for side, tag in (("CE", "ce"), ("PE", "pe")):
-            up_df = candles.get(f"{side}_+{n}", pd.DataFrame())
-            dn_df = candles.get(f"{side}_-{n}", pd.DataFrame())
-            base_close = merged[f"{tag}_close"]
-            if not up_df.empty:
-                merged = merged.merge(
-                    up_df[["timestamp", "close"]].rename(columns={"close": f"__{tag}_up{n}_leg"}),
-                    on="timestamp", how="left",
-                )
-                merged[f"{tag}_up{n}"] = (base_close + merged[f"__{tag}_up{n}_leg"]) / 2
-            else:
-                merged[f"{tag}_up{n}"] = float("nan")
-            if not dn_df.empty:
-                merged = merged.merge(
-                    dn_df[["timestamp", "close"]].rename(columns={"close": f"__{tag}_dn{n}_leg"}),
-                    on="timestamp", how="left",
-                )
-                merged[f"{tag}_dn{n}"] = (base_close + merged[f"__{tag}_dn{n}_leg"]) / 2
-            else:
-                merged[f"{tag}_dn{n}"] = float("nan")
+        spec.append((f"ce_up{n}", "ce_close", f"PE_+{n}"))
+        spec.append((f"ce_dn{n}", "ce_close", f"PE_-{n}"))
+        spec.append((f"pe_up{n}", "pe_close", f"CE_-{n}"))
+        spec.append((f"pe_dn{n}", "pe_close", f"CE_+{n}"))
+
+    for out_col, base_col, candle_key in spec:
+        leg_df = candles.get(candle_key, pd.DataFrame())
+        if leg_df.empty:
+            merged[out_col] = float("nan")
+            continue
+        tmp_col = f"__{out_col}_leg"
+        merged = merged.merge(
+            leg_df[["timestamp", "close"]].rename(columns={"close": tmp_col}),
+            on="timestamp", how="left",
+        )
+        merged[out_col] = (merged[base_col] + merged[tmp_col]) / 2
 
     merged = merged.drop(columns=[c for c in merged.columns if c.startswith("__")])
     return merged.sort_values("timestamp").reset_index(drop=True)
@@ -195,12 +202,46 @@ def _crossed_up(prev_close, prev_line, close, line):
     return prev_close <= prev_line and close > line
 
 
+def _try_open(side, other, tag, prev_row, row):
+    """Look for a fresh close-above-UPn crossover (n=1..3) confirmed by the other
+    leg sitting below its DN1. Only the first level that freshly crosses this bar
+    is considered (matches one signal per bar)."""
+    for n in OFFSETS[:-1]:  # UP1..UP3 -> target UP(n+1); UP4 has no UP5 to chain to
+        if _crossed_up(prev_row[f"{side}_close"], prev_row[f"{side}_up{n}"],
+                        row[f"{side}_close"], row[f"{side}_up{n}"]):
+            if row[f"{other}_close"] < row[f"{other}_dn1"]:
+                return {
+                    "time": row["timestamp"], "side": tag,
+                    "line": f"{side.upper()}-UP{n}", "entry": row[f"{side}_close"],
+                    "target": row[f"{side}_up{n + 1}"], "target_n": n + 1,
+                    "sl": row[f"{side}_low"], "exit": None, "result": "In Trade",
+                }
+            return None  # crossed but not confirmed by the other leg -> no entry this bar
+    return None
+
+
+def _try_chain(side, trade, row):
+    """Target just hit = price already closed above that line, i.e. the next
+    level's breakout condition. Roll straight into it without re-checking the
+    other leg's confirmation (same trade, riding the ladder up)."""
+    n = trade["target_n"]
+    if n >= OFFSETS[-1]:  # UP4 hit -> top of the ladder, cycle ends here
+        return None
+    new_n = n + 1
+    return {
+        "time": row["timestamp"], "side": trade["side"],
+        "line": f"{side.upper()}-UP{n} (chain)", "entry": row[f"{side}_close"],
+        "target": row[f"{side}_up{new_n}"], "target_n": new_n,
+        "sl": row[f"{side}_low"], "exit": None, "result": "In Trade",
+    }
+
+
 def build_journal(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     if df.empty or len(df) < 2:
         return pd.DataFrame()
 
     journal = []
-    open_ce = None  # dict: entry/target/sl/level/... or None
+    open_ce = None  # dict: entry/target/target_n/sl/... or None
     open_pe = None
 
     prev = None
@@ -208,45 +249,37 @@ def build_journal(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
         if prev is not None:
             # ---- CE (bullish) side: CE breaks UPn while PE sits below PE-DN1 ----
             if open_ce is None:
-                for n in OFFSETS[:-1]:  # UP1..UP3 -> target UP(n+1); UP4 has no UP5
-                    if _crossed_up(prev["ce_close"], prev[f"ce_up{n}"], row["ce_close"], row[f"ce_up{n}"]):
-                        if row["pe_close"] < row["pe_dn1"]:
-                            open_ce = {
-                                "time": row["timestamp"], "side": "CE (Bullish)",
-                                "line": f"CE-UP{n}", "entry": row["ce_close"],
-                                "target": row[f"ce_up{n + 1}"], "sl": row["ce_low"],
-                                "exit": None, "result": "In Trade",
-                            }
-                            journal.append(open_ce)
-                        break
+                new_trade = _try_open("ce", "pe", "CE (Bullish)", prev, row)
+                if new_trade:
+                    open_ce = new_trade
+                    journal.append(open_ce)
             else:
                 if row["ce_low"] <= open_ce["sl"]:
                     open_ce["exit"], open_ce["result"] = row["ce_low"], "SL Hit"
                     open_ce = None
                 elif not pd.isna(open_ce["target"]) and row["ce_close"] >= open_ce["target"]:
                     open_ce["exit"], open_ce["result"] = row["ce_close"], "Target Hit"
-                    open_ce = None
+                    chained = _try_chain("ce", open_ce, row)
+                    open_ce = chained
+                    if chained:
+                        journal.append(chained)
 
             # ---- PE (bearish) side: PE breaks UPn while CE sits below CE-DN1 ----
             if open_pe is None:
-                for n in OFFSETS[:-1]:
-                    if _crossed_up(prev["pe_close"], prev[f"pe_up{n}"], row["pe_close"], row[f"pe_up{n}"]):
-                        if row["ce_close"] < row["ce_dn1"]:
-                            open_pe = {
-                                "time": row["timestamp"], "side": "PE (Bearish)",
-                                "line": f"PE-UP{n}", "entry": row["pe_close"],
-                                "target": row[f"pe_up{n + 1}"], "sl": row["pe_low"],
-                                "exit": None, "result": "In Trade",
-                            }
-                            journal.append(open_pe)
-                        break
+                new_trade = _try_open("pe", "ce", "PE (Bearish)", prev, row)
+                if new_trade:
+                    open_pe = new_trade
+                    journal.append(open_pe)
             else:
                 if row["pe_low"] <= open_pe["sl"]:
                     open_pe["exit"], open_pe["result"] = row["pe_low"], "SL Hit"
                     open_pe = None
                 elif not pd.isna(open_pe["target"]) and row["pe_close"] >= open_pe["target"]:
                     open_pe["exit"], open_pe["result"] = row["pe_close"], "Target Hit"
-                    open_pe = None
+                    chained = _try_chain("pe", open_pe, row)
+                    open_pe = chained
+                    if chained:
+                        journal.append(chained)
 
         prev = row
 
