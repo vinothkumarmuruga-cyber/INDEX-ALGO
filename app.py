@@ -151,6 +151,30 @@ def fetch_intraday_candles(instrument_key: str, token: str, interval_minutes: in
     return df.reset_index(drop=True)
 
 
+def _closed_bars_only(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
+    """Drop the trailing candle if it hasn't finished forming yet.
+
+    Upstox's intraday endpoint includes the CURRENT, still-live bar as the
+    last row -- e.g. while it's 9:52, the 9:51 (3-min) candle is still open
+    until 9:54 and its close keeps moving. Running entry/target/SL detection
+    against that live, not-yet-final close means a signal can fire off a
+    price that never actually held once the candle finished -- an "entry"
+    that later turns out to not be a real 3-min-close crossover at all.
+    Only bars whose full interval has already elapsed are kept for the
+    journal; the very latest (possibly still-forming) bar is still used
+    elsewhere for the live levels table.
+    """
+    if df.empty:
+        return df
+    ts = df["timestamp"]
+    tz_aware = getattr(ts.dt, "tz", None) is not None
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    if not tz_aware:
+        now = now.tz_localize(None)
+    bar_end = ts + pd.Timedelta(minutes=interval_minutes)
+    return df[bar_end <= now].reset_index(drop=True)
+
+
 def fetch_many_candles(instrument_keys: dict, token: str, interval_minutes: int) -> dict:
     out = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -518,7 +542,12 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
     st.dataframe(levels_table.style.format("{:.2f}"), use_container_width=True)
 
     # ---- journal ----
-    journal_df = build_journal(levels_df, int(max_rows), sl_buffer=sl_buffer, no_trade_after=no_trade_after)
+    # Entry/target/SL are decided ONLY off fully closed entry_tf candles --
+    # the current, still-forming bar (if Upstox has already started printing
+    # it) is excluded so a signal can never fire off a close that hasn't
+    # actually happened yet.
+    closed_levels_df = _closed_bars_only(levels_df, int(entry_tf))
+    journal_df = build_journal(closed_levels_df, int(max_rows), sl_buffer=sl_buffer, no_trade_after=no_trade_after)
     st.subheader(f"Entry / Target / SL Journal (PnL @ 1 lot = {lot_size})")
     if journal_df.empty:
         st.caption("No signals yet today.")
