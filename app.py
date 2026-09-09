@@ -180,6 +180,32 @@ def _mark_closed_bars(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
     return df
 
 
+def compute_underlying_range_ok(underlying_df: pd.DataFrame, lookback: int, min_range_pct: float) -> pd.DataFrame:
+    """Returns columns: timestamp, underlying_range_ok (bool).
+
+    underlying_range_ok is True once the UNDERLYING INDEX's own high-low
+    range over the last `lookback` closed candles (this bar included) is at
+    least min_range_pct percent of its current close -- i.e. NIFTY/
+    BANKNIFTY/SENSEX itself is actually moving, not sitting in a tight band.
+    This is deliberately checked on the index's own candles, separate from
+    the CE/PE option-premium math: an option "breakout" can fire off premium
+    noise even while the underlying hasn't gone anywhere, which is exactly
+    the consolidation-chop pattern this filter is meant to catch.
+
+    Bars before `lookback` candles of history exist default to True (fail
+    open -- don't block trading just because the day only just started).
+    """
+    if underlying_df.empty:
+        return pd.DataFrame(columns=["timestamp", "underlying_range_ok"])
+    df = underlying_df.sort_values("timestamp").reset_index(drop=True)
+    roll_high = df["high"].rolling(lookback, min_periods=lookback).max()
+    roll_low = df["low"].rolling(lookback, min_periods=lookback).min()
+    range_pct = (roll_high - roll_low) / df["close"] * 100
+    insufficient_history = range_pct.isna()  # NaN >= x is False, not NaN -- check explicitly
+    df["underlying_range_ok"] = (range_pct >= min_range_pct) | insufficient_history
+    return df[["timestamp", "underlying_range_ok"]]
+
+
 def fetch_many_candles(instrument_keys: dict, token: str, interval_minutes: int) -> dict:
     out = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -367,6 +393,13 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer_pct: float = 0.0,
     to finish. If 'bar_closed' isn't present (e.g. in tests), every bar is
     treated as closed.
 
+    ENTRIES additionally require the bar's 'underlying_range_ok' column to be
+    True (set by compute_underlying_range_ok) -- i.e. the underlying index
+    itself has a real recent range, not just the option premium. This is a
+    consolidation filter: it only blocks NEW entries, open trades still exit
+    normally regardless of it. If 'underlying_range_ok' isn't present, every
+    bar is treated as OK (filter effectively off).
+
     A Target Hit or SL Hit simply closes that slot's trade -- there is no
     automatic continuation into another level. A fresh entry in that same
     slot requires a brand-new close-crossover on a later CLOSED bar; price
@@ -388,6 +421,9 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer_pct: float = 0.0,
             entries_allowed = no_trade_after is None or bar_time < no_trade_after
             # entries need a genuinely CLOSED candle; exits below are unconditional
             entries_allowed = entries_allowed and bool(row.get("bar_closed", True))
+            # entries need the UNDERLYING to actually be moving (not consolidating);
+            # exits below are unaffected -- an open trade still exits normally
+            entries_allowed = entries_allowed and bool(row.get("underlying_range_ok", True))
 
             # ---- CE Trend: CE breaks UPn, confirmed by PE below PE-DNn ----
             if open_ce_trend is None:
@@ -476,6 +512,24 @@ with st.sidebar:
         help="Percentage the entry candle's low is pulled down by, e.g. low=75 with buffer=2% -> SL=73.5.",
     )
     no_trade_after = st.time_input("No new trades after", value=dtime(14, 45))
+
+    st.subheader("Consolidation Filter")
+    range_filter_on = st.checkbox(
+        "Skip entries when the underlying isn't moving", value=True,
+        help="Checks NIFTY/BANKNIFTY/SENSEX's OWN recent candle range, separate "
+             "from the option-level math -- if the index itself has been flat, "
+             "an option-premium 'breakout' is more likely noise than a real move.",
+    )
+    range_lookback = st.number_input(
+        "Lookback (bars)", value=10, min_value=2, max_value=100, disabled=not range_filter_on,
+        help="Number of recent entry_tf candles of the underlying to measure the range over.",
+    )
+    range_min_pct = st.number_input(
+        "Min range over lookback (%)", value=0.15, min_value=0.0, step=0.05, disabled=not range_filter_on,
+        help="If the underlying's high-low range over the lookback window is below this "
+             "% of its current price, treat it as consolidation and block new entries. "
+             "Trades already open are unaffected -- they still exit normally.",
+    )
 
     st.subheader("Refresh")
     auto_refresh_on = st.checkbox(
@@ -575,6 +629,22 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
     # trade closes the instant intrabar price touches its level rather than
     # waiting for the candle to finish.
     marked_levels_df = _mark_closed_bars(levels_df, int(entry_tf))
+
+    # ---- consolidation filter: is the UNDERLYING itself actually moving? ----
+    if range_filter_on:
+        try:
+            underlying_candles = fetch_intraday_candles(underlying_key, access_token, int(entry_tf))
+        except Exception as e:
+            underlying_candles = pd.DataFrame()
+            st.warning(f"Underlying range filter: couldn't fetch {symbol} candles ({e}) — filter skipped this refresh.")
+        range_df = compute_underlying_range_ok(underlying_candles, int(range_lookback), float(range_min_pct))
+        if not range_df.empty:
+            marked_levels_df = marked_levels_df.merge(range_df, on="timestamp", how="left")
+            marked_levels_df["underlying_range_ok"] = marked_levels_df["underlying_range_ok"].fillna(True)
+            currently_consolidating = not bool(marked_levels_df["underlying_range_ok"].iloc[-1])
+            if currently_consolidating:
+                st.caption(f"⏸ {symbol} range filter: underlying is consolidating — new entries paused (open trades still exit normally).")
+
     journal_df = build_journal(marked_levels_df, int(max_rows), sl_buffer_pct=sl_buffer_pct, no_trade_after=no_trade_after)
     st.subheader(f"Entry / Target / SL Journal (PnL @ 1 lot = {lot_size})")
     if journal_df.empty:
