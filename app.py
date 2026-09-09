@@ -582,15 +582,19 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
     else:
         journal_df = journal_df.copy()
         journal_df["pnl"] = journal_df["pnl_points"] * lot_size  # keep numeric for the total below
+        # risk/reward distance, fixed at entry -- doesn't change as the trade plays out
+        journal_df["entry_to_tgt"] = journal_df["target"] - journal_df["entry"]
+        journal_df["entry_to_sl"] = journal_df["entry"] - journal_df["sl"]
 
         display_df = journal_df.rename(columns={
             "time": "Time", "side": "Side", "line": "Line",
             "entry": "Entry", "target": "Target", "sl": "SL",
+            "entry_to_tgt": "Entry to TGT (pts)", "entry_to_sl": "Entry to SL (pts)",
             "exit": "Exit", "result": "Result", "pnl": "PnL (1 lot)",
         })
         display_df.insert(0, "Symbol", tag)  # tag every row with its own tab (NIFTY / BN / SENSEX)
         display_df["Time"] = pd.to_datetime(display_df["Time"]).dt.strftime("%H:%M")
-        for c in ["Entry", "Target", "SL", "Exit"]:
+        for c in ["Entry", "Target", "SL", "Entry to TGT (pts)", "Entry to SL (pts)", "Exit"]:
             display_df[c] = display_df[c].map(lambda v: "-" if pd.isna(v) else f"{v:.2f}")
         display_df["PnL (1 lot)"] = display_df["PnL (1 lot)"].map(lambda v: "-" if pd.isna(v) else f"{v:+.2f}")
         display_df = display_df.drop(columns=["pnl_points"])
