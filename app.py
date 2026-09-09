@@ -151,20 +151,24 @@ def fetch_intraday_candles(instrument_key: str, token: str, interval_minutes: in
     return df.reset_index(drop=True)
 
 
-def _closed_bars_only(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
-    """Drop the trailing candle if it hasn't finished forming yet.
+def _mark_closed_bars(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
+    """Add a 'bar_closed' column: True once a bar's full interval has
+    elapsed, False for the CURRENT, still-live bar.
 
-    Upstox's intraday endpoint includes the CURRENT, still-live bar as the
-    last row -- e.g. while it's 9:52, the 9:51 (3-min) candle is still open
-    until 9:54 and its close keeps moving. Running entry/target/SL detection
-    against that live, not-yet-final close means a signal can fire off a
-    price that never actually held once the candle finished -- an "entry"
-    that later turns out to not be a real 3-min-close crossover at all.
-    Only bars whose full interval has already elapsed are kept for the
-    journal; the very latest (possibly still-forming) bar is still used
-    elsewhere for the live levels table.
+    Upstox's intraday endpoint includes the current, still-forming candle as
+    the last row -- e.g. while it's 9:52, the 9:51 (3-min) candle is still
+    open until 9:54 and its close keeps moving. A fresh ENTRY crossover has
+    to be checked against a close that's actually final, so entries only
+    fire once bar_closed is True for that bar.
+
+    Target/SL EXITS are different: they react to intrabar price immediately,
+    so they run on every bar regardless of this flag -- a trade closes the
+    instant price touches its level, it does not wait for the candle to
+    finish. This column only gates entries (see build_journal).
     """
+    df = df.copy()
     if df.empty:
+        df["bar_closed"] = pd.Series(dtype=bool)
         return df
     ts = df["timestamp"]
     tz_aware = getattr(ts.dt, "tz", None) is not None
@@ -172,7 +176,8 @@ def _closed_bars_only(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
     if not tz_aware:
         now = now.tz_localize(None)
     bar_end = ts + pd.Timedelta(minutes=interval_minutes)
-    return df[bar_end <= now].reset_index(drop=True)
+    df["bar_closed"] = bar_end <= now
+    return df
 
 
 def fetch_many_candles(instrument_keys: dict, token: str, interval_minutes: int) -> dict:
@@ -264,7 +269,15 @@ def _crossed_up(prev_close, prev_line, close, line):
     return prev_close <= prev_line and close > line
 
 
-def _try_open(side, other, tag, prev_row, row, sl_buffer):
+def _sl_from_low(low, sl_buffer_pct):
+    """SL = candle low, pulled down by a PERCENTAGE of that low (not a fixed
+    point amount) -- e.g. low=75 with buffer=2% -> SL=73.5. A % buffer scales
+    with the premium instead of being too tight on cheap options and too
+    loose on expensive ones."""
+    return low * (1 - sl_buffer_pct / 100)
+
+
+def _try_open(side, other, tag, prev_row, row, sl_buffer_pct):
     """Look for a fresh close-above-UPn crossover (n=1..3) confirmed by the other
     leg sitting below ITS DNn AT THE SAME LEVEL n (e.g. UP2 entry needs the other
     leg below DN2, not DN1). Only the first level that freshly crosses this bar
@@ -279,14 +292,14 @@ def _try_open(side, other, tag, prev_row, row, sl_buffer):
                     "time": row["timestamp"], "side": tag,
                     "line": f"{side.upper()}-UP{n}", "entry": row[f"{side}_close"],
                     "target": row[f"{side}_up{n + 1}"], "target_n": n + 1,
-                    "sl": row[f"{side}_low"] - sl_buffer, "exit": None, "result": "In Trade",
-                    "pnl_points": None,
+                    "sl": _sl_from_low(row[f"{side}_low"], sl_buffer_pct), "exit": None,
+                    "result": "In Trade", "pnl_points": None,
                 }
             return None  # crossed but not confirmed by the other leg -> no entry this bar
     return None
 
 
-def _try_open_reversal(side, other, tag, prev_row, row, sl_buffer):
+def _try_open_reversal(side, other, tag, prev_row, row, sl_buffer_pct):
     """Reversal entry: <side> closes back ABOVE its own DNn line (a fresh
     close-crossover of the DN ladder -- same mechanics as _try_open, just
     mirrored onto DN instead of UP), after having been at/below it. This is
@@ -304,8 +317,8 @@ def _try_open_reversal(side, other, tag, prev_row, row, sl_buffer):
                     "time": row["timestamp"], "side": tag,
                     "line": f"{side.upper()}-DN{n} (Reversal)", "entry": row[f"{side}_close"],
                     "target": target, "target_n": n - 1,
-                    "sl": row[f"{side}_low"] - sl_buffer, "exit": None, "result": "In Trade",
-                    "pnl_points": None,
+                    "sl": _sl_from_low(row[f"{side}_low"], sl_buffer_pct), "exit": None,
+                    "result": "In Trade", "pnl_points": None,
                 }
             return None  # crossed but not confirmed by the other leg -> no entry this bar
     return None
@@ -317,7 +330,7 @@ def _close_trade(trade, exit_price, result):
     trade["pnl_points"] = exit_price - trade["entry"]  # long-premium PnL: +ve on Target Hit, -ve on SL Hit
 
 
-def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
+def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer_pct: float = 0.0,
                    no_trade_after: dtime | None = None) -> pd.DataFrame:
     """
     Four independent trade slots run in parallel: CE-Trend, CE-Reversal,
@@ -336,17 +349,28 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
                        centre: DN(n-1), or the shared BEP centre line when
                        n==1.
 
-    sl_buffer: points subtracted from the entry candle's low before it's used
-        as SL, e.g. sl_buffer=2 turns a low of 75 into an SL of 73 (a little
-        room below the candle so a wick-touch doesn't stop you out instantly).
+    sl_buffer_pct: PERCENTAGE the entry candle's low is pulled down by before
+        it's used as SL, e.g. sl_buffer_pct=2 turns a low of 75 into an SL of
+        73.5 (a little room below the candle so a wick-touch doesn't stop
+        you out instantly; a % buffer scales with the premium instead of
+        being a fixed point amount).
     no_trade_after: no NEW entries (in any slot) on bars whose candle time is
         at/after this cutoff. Trades already open still get their SL/target
         checked and can still close normally.
 
+    ENTRIES only ever fire on a bar whose 'bar_closed' column is True (set by
+    _mark_closed_bars) -- i.e. a genuinely finished entry_tf candle, never
+    the current still-forming one, since its close keeps moving. EXITS
+    (target/SL) are the opposite: they check every bar's intrabar high/low
+    UNCONDITIONALLY, including the current forming bar, so a trade closes
+    the instant price touches its level rather than waiting for the candle
+    to finish. If 'bar_closed' isn't present (e.g. in tests), every bar is
+    treated as closed.
+
     A Target Hit or SL Hit simply closes that slot's trade -- there is no
     automatic continuation into another level. A fresh entry in that same
-    slot requires a brand-new close-crossover on a later bar; price has to
-    pull back (or dip, for a reversal) and freshly recross.
+    slot requires a brand-new close-crossover on a later CLOSED bar; price
+    has to pull back (or dip, for a reversal) and freshly recross.
     """
     if df.empty or len(df) < 2:
         return pd.DataFrame()
@@ -362,10 +386,12 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
         if prev is not None:
             bar_time = pd.Timestamp(row["timestamp"]).time()
             entries_allowed = no_trade_after is None or bar_time < no_trade_after
+            # entries need a genuinely CLOSED candle; exits below are unconditional
+            entries_allowed = entries_allowed and bool(row.get("bar_closed", True))
 
             # ---- CE Trend: CE breaks UPn, confirmed by PE below PE-DNn ----
             if open_ce_trend is None:
-                new_trade = _try_open("ce", "pe", "CE (Bullish)", prev, row, sl_buffer) if entries_allowed else None
+                new_trade = _try_open("ce", "pe", "CE (Bullish)", prev, row, sl_buffer_pct) if entries_allowed else None
                 if new_trade:
                     open_ce_trend = new_trade
                     journal.append(open_ce_trend)
@@ -379,7 +405,7 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
 
             # ---- CE Reversal: CE recovers back above DNn, confirmed by PE below PE-UPn ----
             if open_ce_rev is None:
-                new_trade = _try_open_reversal("ce", "pe", "CE (Bullish Reversal)", prev, row, sl_buffer) if entries_allowed else None
+                new_trade = _try_open_reversal("ce", "pe", "CE (Bullish Reversal)", prev, row, sl_buffer_pct) if entries_allowed else None
                 if new_trade:
                     open_ce_rev = new_trade
                     journal.append(open_ce_rev)
@@ -393,7 +419,7 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
 
             # ---- PE Trend: PE breaks UPn, confirmed by CE below CE-DNn ----
             if open_pe_trend is None:
-                new_trade = _try_open("pe", "ce", "PE (Bearish)", prev, row, sl_buffer) if entries_allowed else None
+                new_trade = _try_open("pe", "ce", "PE (Bearish)", prev, row, sl_buffer_pct) if entries_allowed else None
                 if new_trade:
                     open_pe_trend = new_trade
                     journal.append(open_pe_trend)
@@ -407,7 +433,7 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
 
             # ---- PE Reversal: PE recovers back above DNn, confirmed by CE below CE-UPn ----
             if open_pe_rev is None:
-                new_trade = _try_open_reversal("pe", "ce", "PE (Bearish Reversal)", prev, row, sl_buffer) if entries_allowed else None
+                new_trade = _try_open_reversal("pe", "ce", "PE (Bearish Reversal)", prev, row, sl_buffer_pct) if entries_allowed else None
                 if new_trade:
                     open_pe_rev = new_trade
                     journal.append(open_pe_rev)
@@ -445,9 +471,9 @@ with st.sidebar:
     st.subheader("Signal Settings (applies to all tabs)")
     entry_tf = st.selectbox("Entry Timeframe (minutes)", [1, 3, 5, 10, 15], index=1)
     max_rows = st.number_input("Max Rows in Journal", value=20, min_value=1, max_value=200)
-    sl_buffer = st.number_input(
-        "SL Buffer (points below candle low)", value=2.0, min_value=0.0, step=0.5,
-        help="Subtracted from the entry candle's low, e.g. low=75 with buffer=2 -> SL=73.",
+    sl_buffer_pct = st.number_input(
+        "SL Buffer (% below candle low)", value=2.0, min_value=0.0, max_value=50.0, step=0.5,
+        help="Percentage the entry candle's low is pulled down by, e.g. low=75 with buffer=2% -> SL=73.5.",
     )
     no_trade_after = st.time_input("No new trades after", value=dtime(14, 45))
 
@@ -542,12 +568,14 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
     st.dataframe(levels_table.style.format("{:.2f}"), use_container_width=True)
 
     # ---- journal ----
-    # Entry/target/SL are decided ONLY off fully closed entry_tf candles --
-    # the current, still-forming bar (if Upstox has already started printing
-    # it) is excluded so a signal can never fire off a close that hasn't
-    # actually happened yet.
-    closed_levels_df = _closed_bars_only(levels_df, int(entry_tf))
-    journal_df = build_journal(closed_levels_df, int(max_rows), sl_buffer=sl_buffer, no_trade_after=no_trade_after)
+    # ENTRIES only ever fire off a fully closed entry_tf candle (bar_closed
+    # column below) -- the current, still-forming bar's close keeps moving
+    # and can't be trusted for a fresh crossover. EXITS (target/SL) are the
+    # opposite: they run on every bar including the current live one, so a
+    # trade closes the instant intrabar price touches its level rather than
+    # waiting for the candle to finish.
+    marked_levels_df = _mark_closed_bars(levels_df, int(entry_tf))
+    journal_df = build_journal(marked_levels_df, int(max_rows), sl_buffer_pct=sl_buffer_pct, no_trade_after=no_trade_after)
     st.subheader(f"Entry / Target / SL Journal (PnL @ 1 lot = {lot_size})")
     if journal_df.empty:
         st.caption("No signals yet today.")
