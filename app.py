@@ -237,12 +237,15 @@ def _crossed_up(prev_close, prev_line, close, line):
 
 def _try_open(side, other, tag, prev_row, row, sl_buffer):
     """Look for a fresh close-above-UPn crossover (n=1..3) confirmed by the other
-    leg sitting below its DN1. Only the first level that freshly crosses this bar
-    is considered (matches one signal per bar)."""
-    for n in OFFSETS[:-1]:  # UP1..UP3 -> target UP(n+1); UP4 has no UP5 to chain to
+    leg sitting below ITS DNn AT THE SAME LEVEL n (e.g. UP2 entry needs the other
+    leg below DN2, not DN1). Only the first level that freshly crosses this bar
+    is considered (matches one signal per bar). Every entry -- at UP1 or UP2 or
+    UP3 -- requires a genuine fresh crossover of that level; there is no automatic
+    continuation from a previous trade."""
+    for n in OFFSETS[:-1]:  # UP1..UP3 -> target UP(n+1); UP4 has no UP5 above it
         if _crossed_up(prev_row[f"{side}_close"], prev_row[f"{side}_up{n}"],
                         row[f"{side}_close"], row[f"{side}_up{n}"]):
-            if row[f"{other}_close"] < row[f"{other}_dn1"]:
+            if row[f"{other}_close"] < row[f"{other}_dn{n}"]:
                 return {
                     "time": row["timestamp"], "side": tag,
                     "line": f"{side.upper()}-UP{n}", "entry": row[f"{side}_close"],
@@ -252,25 +255,6 @@ def _try_open(side, other, tag, prev_row, row, sl_buffer):
                 }
             return None  # crossed but not confirmed by the other leg -> no entry this bar
     return None
-
-
-def _try_chain(side, trade, row, sl_buffer):
-    """Target just hit (an intrabar touch, not necessarily a close) = price already
-    reached the next level's breakout price. Roll straight into it, entering at
-    that same touched level (not the bar's close, which can be anywhere after a
-    spike-and-pullback), without re-checking the other leg's confirmation (same
-    trade, riding the ladder up)."""
-    n = trade["target_n"]
-    if n >= OFFSETS[-1]:  # UP4 hit -> top of the ladder, cycle ends here
-        return None
-    new_n = n + 1
-    return {
-        "time": row["timestamp"], "side": trade["side"],
-        "line": f"{side.upper()}-UP{n} (chain)", "entry": trade["target"],
-        "target": row[f"{side}_up{new_n}"], "target_n": new_n,
-        "sl": row[f"{side}_low"] - sl_buffer, "exit": None, "result": "In Trade",
-        "pnl_points": None,
-    }
 
 
 def _close_trade(trade, exit_price, result):
@@ -285,9 +269,14 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
     sl_buffer: points subtracted from the entry candle's low before it's used
         as SL, e.g. sl_buffer=2 turns a low of 75 into an SL of 73 (a little
         room below the candle so a wick-touch doesn't stop you out instantly).
-    no_trade_after: no NEW entries (fresh or chained) on bars whose candle
-        time is at/after this cutoff. Trades already open still get their
-        SL/target checked and can still close normally.
+    no_trade_after: no NEW entries on bars whose candle time is at/after this
+        cutoff. Trades already open still get their SL/target checked and can
+        still close normally.
+
+    A Target Hit or SL Hit simply closes the trade -- there is no automatic
+    continuation into the next level. A fresh entry at any level (same level
+    again, or a different one) requires a brand-new close-crossover detected
+    by _try_open on a later bar; price has to pull back and freshly recross.
     """
     if df.empty or len(df) < 2:
         return pd.DataFrame()
@@ -314,10 +303,7 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
                     open_ce = None
                 elif not pd.isna(open_ce["target"]) and row["ce_high"] >= open_ce["target"]:
                     _close_trade(open_ce, open_ce["target"], "Target Hit")
-                    chained = _try_chain("ce", open_ce, row, sl_buffer) if entries_allowed else None
-                    open_ce = chained
-                    if chained:
-                        journal.append(chained)
+                    open_ce = None
 
             # ---- PE (bearish) side: PE breaks UPn while CE sits below CE-DN1 ----
             if open_pe is None:
@@ -331,10 +317,7 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer: float = 0.0,
                     open_pe = None
                 elif not pd.isna(open_pe["target"]) and row["pe_high"] >= open_pe["target"]:
                     _close_trade(open_pe, open_pe["target"], "Target Hit")
-                    chained = _try_chain("pe", open_pe, row, sl_buffer) if entries_allowed else None
-                    open_pe = chained
-                    if chained:
-                        journal.append(chained)
+                    open_pe = None
 
         prev = row
 
