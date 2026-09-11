@@ -4,9 +4,9 @@ Nifty CE/PE BEP Levels — Live Entry/Target/SL Journal (Streamlit + Upstox v3)
 
 Reproduces, live, the level/entry table you sketched:
 
-    NIFTY OPEN | STRIKE CE | UP1 UP2 UP3 UP4 | DN1 DN2 DN3 DN4
+    NIFTY OPEN | STRIKE CE | UP1 UP2 UP3 UP4 UP5 | DN1 DN2 DN3 DN4 DN5
     23747      |   23750   |
-               | STRIKE PE | UP1 UP2 UP3 UP4 | DN1 DN2 DN3 DN4
+               | STRIKE PE | UP1 UP2 UP3 UP4 UP5 | DN1 DN2 DN3 DN4 DN5
                |   23750   |
 
 Nearby strike = today's NIFTY open rounded to the strike step. UPn/DNn are
@@ -27,8 +27,9 @@ ENTRY LOGIC (as you described):
     Bearish (PE) entry -> vice versa: PE closes above PE-UP1 AND CE is
                            below CE-DN1.
                            Target = PE-UP2. SL = that PE candle's low.
-    Laddered: the same check runs at UP2 (target UP3) and UP3 (target UP4)
-              too, so a trade can also start off a UP2/UP3 breakout.
+    Laddered: the same check runs at UP2 (target UP3), UP3 (target UP4), and
+              UP4 (target UP5) too, so a trade can also start off a
+              UP2/UP3/UP4 breakout.
 
 This is SIGNAL-ONLY — it does not place orders. You confirmed that in the
 requirements. Paste your Upstox v3 access token in the sidebar; it must be
@@ -51,7 +52,7 @@ st.set_page_config(page_title="Nifty CE/PE BEP Levels", layout="wide")
 
 BASE_URL = "https://api.upstox.com"
 
-OFFSETS = [1, 2, 3, 4]  # UP1..UP4 / DN1..DN4 (multiplied by strike step)
+OFFSETS = [1, 2, 3, 4, 5]  # UP1..UP5 / DN1..DN5 (multiplied by strike step)
 
 # One tab per index. expiry_weekday: 0=Mon .. 6=Sun. monthly_only=True means
 # only the last occurrence of that weekday in the month trades (matches
@@ -310,7 +311,7 @@ def _try_open(side, other, tag, prev_row, row, sl_buffer_pct):
     is considered (matches one signal per bar). Every entry -- at UP1 or UP2 or
     UP3 -- requires a genuine fresh crossover of that level; there is no automatic
     continuation from a previous trade."""
-    for n in OFFSETS[:-1]:  # UP1..UP3 -> target UP(n+1); UP4 has no UP5 above it
+    for n in OFFSETS[:-1]:  # UP1..UP4 -> target UP(n+1); UP5 has no UP6 above it
         if _crossed_up(prev_row[f"{side}_close"], prev_row[f"{side}_up{n}"],
                         row[f"{side}_close"], row[f"{side}_up{n}"]):
             if row[f"{other}_close"] < row[f"{other}_dn{n}"]:
@@ -341,7 +342,7 @@ def _try_open_reversal(side, other, tag, prev_row, row, sl_buffer_pct):
     (mirror image of the trend entry's confirmation, which checks the other
     leg's DNn). Target is the next level toward the centre: DN(n-1) for
     n=2..4, or the shared BEP centre line when n==1 (there is no DN0)."""
-    for n in OFFSETS:  # DN1..DN4 -- every level can trigger a reversal
+    for n in OFFSETS:  # DN1..DN5 -- every level can trigger a reversal
         if _crossed_up(prev_row[f"{side}_close"], prev_row[f"{side}_dn{n}"],
                         row[f"{side}_close"], row[f"{side}_dn{n}"]):
             if row[f"{other}_close"] < row[f"{other}_up{n}"]:
@@ -663,8 +664,10 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
             "0": last.get("bep_center"),
             "UP1": last.get(f"{prefix}_up1"), "UP2": last.get(f"{prefix}_up2"),
             "UP3": last.get(f"{prefix}_up3"), "UP4": last.get(f"{prefix}_up4"),
+            "UP5": last.get(f"{prefix}_up5"),
             "DN1": last.get(f"{prefix}_dn1"), "DN2": last.get(f"{prefix}_dn2"),
             "DN3": last.get(f"{prefix}_dn3"), "DN4": last.get(f"{prefix}_dn4"),
+            "DN5": last.get(f"{prefix}_dn5"),
         }
 
     levels_table = pd.DataFrame([
