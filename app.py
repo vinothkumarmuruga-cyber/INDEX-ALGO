@@ -362,47 +362,25 @@ def _try_open_reversal(side, other, tag, prev_row, row, sl_buffer_pct):
     return None
 
 
-def diagnose_entry(side, other, kind, prev_row, row, blocked_reasons):
-    """Human-readable explanation of what the entry logic sees on THIS bar
-    for one (side, kind) slot, independent of whether it's actually open --
-    this is the read-only "why (no) entry" check, it never opens or touches
-    a trade.
+def _bep_side(row):
+    """Which leg is currently trading ABOVE the shared BEP centre line (the
+    '0' row/column -- bep_center, avg of ATM CE and ATM PE closes).
 
-    kind: 'trend' (checks UPn crossover, confirmed by other leg's DNn) or
-    'reversal' (checks DNn crossover, confirmed by other leg's UPn). Mirrors
-    _try_open / _try_open_reversal's exact level-matching logic so this
-    panel can never disagree with what the real engine would do.
+    Since bep_center is exactly the midpoint of ce_close and pe_close, at
+    most one side can be above it at a time (a tie means neither is). This
+    is used as a directional-bias gate: only the side currently above BEP
+    gets to take NEW entries (trend or reversal) this bar -- the other side
+    is paused until it's the one trading above BEP. Returns 'ce', 'pe', or
+    None (tie or missing data -- no side favoured, both paused).
     """
-    levels = OFFSETS[:-1] if kind == "trend" else OFFSETS
-    own_prefix = "up" if kind == "trend" else "dn"
-    other_prefix = "dn" if kind == "trend" else "up"
-    for n in levels:
-        own_line_prev = prev_row[f"{side}_{own_prefix}{n}"]
-        own_line_now = row[f"{side}_{own_prefix}{n}"]
-        if _crossed_up(prev_row[f"{side}_close"], own_line_prev, row[f"{side}_close"], own_line_now):
-            other_close = row[f"{other}_close"]
-            other_line = row[f"{other}_{other_prefix}{n}"]
-            level_name = f"{own_prefix.upper()}{n}"
-            if pd.isna(other_close) or pd.isna(other_line):
-                return f"Crossed {level_name} but {other.upper()} data missing -- can't confirm"
-            if other_close < other_line:
-                entry_price = row[f"{side}_close"]
-                if kind == "trend":
-                    target = row.get(f"{side}_up{n + 1}") if n < OFFSETS[-1] else None
-                else:
-                    target = row.get("bep_center") if n == 1 else row.get(f"{side}_dn{n - 1}")
-                if pd.isna(target) or target is None or target <= entry_price:
-                    return (f"Confirmed at {level_name} but TARGET INVALID -- next level is "
-                            f"{('n/a' if target is None or pd.isna(target) else f'{target:.2f}')}, "
-                            f"not above entry {entry_price:.2f} (likely a stale/illiquid far-strike "
-                            f"close) -- entry skipped for safety")
-                if blocked_reasons:
-                    return f"Confirmed at {level_name} -- BLOCKED: {', '.join(blocked_reasons)}"
-                return f"ENTRY at {level_name} this bar"
-            return (f"Crossed {level_name} but NOT confirmed -- {other.upper()} close "
-                     f"{other_close:.2f} needs to be below {other.upper()}-{other_prefix.upper()}{n} "
-                     f"({other_line:.2f}), currently {other_close - other_line:+.2f} away")
-    return "No fresh crossover this bar"
+    ce_close, pe_close, bep = row.get("ce_close"), row.get("pe_close"), row.get("bep_center")
+    if pd.isna(ce_close) or pd.isna(pe_close) or pd.isna(bep):
+        return None
+    if ce_close > bep:
+        return "ce"
+    if pe_close > bep:
+        return "pe"
+    return None
 
 
 def _close_trade(trade, exit_price, result):
@@ -455,6 +433,13 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer_pct: float = 0.0,
     normally regardless of it. If 'underlying_range_ok' isn't present, every
     bar is treated as OK (filter effectively off).
 
+    ENTRIES are also gated by which leg is trading above the shared BEP
+    centre line ('0' in the levels table, see _bep_side): only CE or only PE
+    gets to open NEW trades on a given bar -- whichever one's close is
+    currently above bep_center -- never both. A tie (or missing bep_center)
+    pauses new entries on BOTH sides that bar. Open trades on the paused
+    side are unaffected and still exit normally.
+
     A Target Hit or SL Hit simply closes that slot's trade -- there is no
     automatic continuation into another level. A fresh entry in that same
     slot requires a brand-new close-crossover on a later CLOSED bar; price
@@ -480,9 +465,17 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer_pct: float = 0.0,
             # exits below are unaffected -- an open trade still exits normally
             entries_allowed = entries_allowed and bool(row.get("underlying_range_ok", True))
 
+            # directional-bias gate: only the side currently trading above the
+            # shared BEP centre line ('0') gets new entries this bar; exits
+            # below are unaffected -- an open trade on the paused side still
+            # exits normally
+            bep_side = _bep_side(row)
+            ce_entries_allowed = entries_allowed and bep_side == "ce"
+            pe_entries_allowed = entries_allowed and bep_side == "pe"
+
             # ---- CE Trend: CE breaks UPn, confirmed by PE below PE-DNn ----
             if open_ce_trend is None:
-                new_trade = _try_open("ce", "pe", "CE (Bullish)", prev, row, sl_buffer_pct) if entries_allowed else None
+                new_trade = _try_open("ce", "pe", "CE (Bullish)", prev, row, sl_buffer_pct) if ce_entries_allowed else None
                 if new_trade:
                     open_ce_trend = new_trade
                     journal.append(open_ce_trend)
@@ -496,7 +489,7 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer_pct: float = 0.0,
 
             # ---- CE Reversal: CE recovers back above DNn, confirmed by PE below PE-UPn ----
             if open_ce_rev is None:
-                new_trade = _try_open_reversal("ce", "pe", "CE (Bullish Reversal)", prev, row, sl_buffer_pct) if entries_allowed else None
+                new_trade = _try_open_reversal("ce", "pe", "CE (Bullish Reversal)", prev, row, sl_buffer_pct) if ce_entries_allowed else None
                 if new_trade:
                     open_ce_rev = new_trade
                     journal.append(open_ce_rev)
@@ -510,7 +503,7 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer_pct: float = 0.0,
 
             # ---- PE Trend: PE breaks UPn, confirmed by CE below CE-DNn ----
             if open_pe_trend is None:
-                new_trade = _try_open("pe", "ce", "PE (Bearish)", prev, row, sl_buffer_pct) if entries_allowed else None
+                new_trade = _try_open("pe", "ce", "PE (Bearish)", prev, row, sl_buffer_pct) if pe_entries_allowed else None
                 if new_trade:
                     open_pe_trend = new_trade
                     journal.append(open_pe_trend)
@@ -524,7 +517,7 @@ def build_journal(df: pd.DataFrame, max_rows: int, sl_buffer_pct: float = 0.0,
 
             # ---- PE Reversal: PE recovers back above DNn, confirmed by CE below CE-UPn ----
             if open_pe_rev is None:
-                new_trade = _try_open_reversal("pe", "ce", "PE (Bearish Reversal)", prev, row, sl_buffer_pct) if entries_allowed else None
+                new_trade = _try_open_reversal("pe", "ce", "PE (Bearish Reversal)", prev, row, sl_buffer_pct) if pe_entries_allowed else None
                 if new_trade:
                     open_pe_rev = new_trade
                     journal.append(open_pe_rev)
@@ -661,9 +654,13 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
     last = levels_df.iloc[-1]
 
     # ---- levels table, laid out like your sketch ----
+    # "0" is the shared BEP centre line (bep_center, avg of ATM CE + ATM PE
+    # close) -- same value on both rows. Whichever leg is trading ABOVE it
+    # is the only side that takes new entries this bar (see _bep_side).
     def level_row(prefix, label):
         return {
             "": label,
+            "0": last.get("bep_center"),
             "UP1": last.get(f"{prefix}_up1"), "UP2": last.get(f"{prefix}_up2"),
             "UP3": last.get(f"{prefix}_up3"), "UP4": last.get(f"{prefix}_up4"),
             "DN1": last.get(f"{prefix}_dn1"), "DN2": last.get(f"{prefix}_dn2"),
@@ -675,6 +672,14 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
         level_row("pe", f"STRIKE PE {atm_strike} (close {last['pe_close']:.2f})"),
     ]).set_index("")
     st.dataframe(levels_table.style.format("{:.2f}"), use_container_width=True)
+
+    bep_side_now = _bep_side(last)
+    if bep_side_now == "ce":
+        st.caption(f"CE trading above 0 (BEP {last.get('bep_center'):.2f}) — only CE entries allowed this bar.")
+    elif bep_side_now == "pe":
+        st.caption(f"PE trading above 0 (BEP {last.get('bep_center'):.2f}) — only PE entries allowed this bar.")
+    else:
+        st.caption("Neither leg clearly above 0 (BEP) — new entries paused on both sides this bar.")
 
     # ---- journal ----
     # ENTRIES only ever fire off a fully closed entry_tf candle (bar_closed
@@ -735,52 +740,6 @@ def render_symbol(symbol: str, tag: str, underlying_key: str, strike_step: int, 
                 f"Realized PnL today ({len(realized)} closed trade{'s' if len(realized) != 1 else ''}, "
                 f"1 lot = {lot_size}): **{realized.sum():+.2f}**"
             )
-
-    # ---- live "why (no) entry" diagnostics for the current bar ----
-    # Answers "why didn't it take this trade" without needing a screenshot:
-    # shows, for all 4 slots, exactly what the entry logic saw on the latest
-    # bar -- no fresh cross / crossed-but-not-confirmed (with the exact gap
-    # to close) / confirmed-but-blocked (and by what) / already in trade.
-    with st.expander("Why (no) entry? — live diagnostics", expanded=False):
-        if len(marked_levels_df) < 2:
-            st.caption("Not enough candles yet.")
-        else:
-            diag_prev = marked_levels_df.iloc[-2]
-            diag_row = marked_levels_df.iloc[-1]
-
-            blocked_reasons = []
-            if not bool(diag_row.get("bar_closed", True)):
-                blocked_reasons.append("current candle still forming")
-            if not bool(diag_row.get("underlying_range_ok", True)):
-                blocked_reasons.append("underlying consolidating (range filter)")
-            diag_bar_time = pd.Timestamp(diag_row["timestamp"]).time()
-            if no_trade_after is not None and diag_bar_time >= no_trade_after:
-                blocked_reasons.append("past no-trade-after cutoff")
-
-            # which slots currently have an open trade, per the just-built journal
-            open_slots = {"CE (Bullish)": False, "CE (Bullish Reversal)": False,
-                          "PE (Bearish)": False, "PE (Bearish Reversal)": False}
-            if not journal_df.empty:
-                for _, r in journal_df[journal_df["result"] == "In Trade"].iterrows():
-                    if r["side"] in open_slots:
-                        open_slots[r["side"]] = True
-
-            def slot_status(tag, side, other, kind):
-                if open_slots.get(tag):
-                    open_row = journal_df[(journal_df["side"] == tag) & (journal_df["result"] == "In Trade")].iloc[0]
-                    entry_t = pd.Timestamp(open_row["time"]).strftime("%H:%M")
-                    return f"In Trade since {entry_t} ({open_row['line']}) — no new entry until this closes"
-                return diagnose_entry(side, other, kind, diag_prev, diag_row, blocked_reasons)
-
-            diag_table = pd.DataFrame([
-                {"Slot": "CE Trend", "Status": slot_status("CE (Bullish)", "ce", "pe", "trend")},
-                {"Slot": "CE Reversal", "Status": slot_status("CE (Bullish Reversal)", "ce", "pe", "reversal")},
-                {"Slot": "PE Trend", "Status": slot_status("PE (Bearish)", "pe", "ce", "trend")},
-                {"Slot": "PE Reversal", "Status": slot_status("PE (Bearish Reversal)", "pe", "ce", "reversal")},
-            ])
-            st.dataframe(diag_table, use_container_width=True, hide_index=True)
-            closed_note = "closed" if bool(diag_row.get("bar_closed", True)) else "still forming"
-            st.caption(f"Diagnostics for bar: {pd.Timestamp(diag_row['timestamp']).strftime('%H:%M')} ({closed_note})")
 
     st.caption(f"Last updated: {pd.Timestamp.now(tz='Asia/Kolkata').strftime('%H:%M:%S')}")
 
